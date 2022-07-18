@@ -3,38 +3,15 @@
 const helper = require('./helper');
 const config = require('./config');
 
-var env_check = true;
-
-if (!config.AZURE_APP_ID) { helper.error("config", "env var `AZURE_APP_ID` must be set"); env_check = false; }
-if (!config.AZURE_APP_SECRET) { helper.error("config", "env var `AZURE_APP_SECRET` must be set"); env_check = false; }
-if (!config.AZURE_TENANTID) { helper.error("config", "env var `AZURE_TENANTID` must be set"); env_check = false; }
-
-if (!config.LDAP_DOMAIN) { helper.error("config", "env var `LDAP_DOMAIN` must be set"); env_check = false; }
-if (!config.LDAP_BASEDN) { helper.error("config", "env var `LDAP_BASEDN` must be set"); env_check = false; }
-if (config.LDAP_BASEDN.indexOf(",") < 0) { helper.warn("config", "env var `LDAP_BASEDN` has the wrong format: `dc=DOMAIN,dc=TLD`"); }
-if (config.LDAP_BASEDN.indexOf(" ") > -1) { helper.warn("config", "env var `LDAP_BASEDN` should not have spaces in it"); }
-
-if (!config.LDAP_PORT) { helper.error("config", "env var `LDAP_PORT` must be set"); env_check = false; }
-if (!config.LDAP_BINDUSER) helper.forceLog("config", "env var `LDAP_BINDUSER` is not set; If you plan to handle multiple synced users on a Synology-NAS you should set it to bind your NAS with it.");
-
-if (!config.LDAP_GROUPSDN) { helper.error("config", "env var `LDAP_GROUPSDN` not set correctly"); env_check = false; }
-if (!config.LDAP_USERSDN) { helper.error("config", "env var `LDAP_USERSDN` not set correctly"); env_check = false; }
-if (!config.LDAP_USERSGROUPSBASEDN) { helper.error("config", "env var `LDAP_USERSGROUPSBASEDN` not set correctly"); env_check = false; }
-if (!config.LDAP_USERRDN) { helper.error("config", "env var `LDAP_USERRDN` not set correctly"); env_check = false; }
-if (!config.LDAP_DATAFILE) { helper.error("config", "env var `LDAP_DATAFILE` not set correctly"); env_check = false; }
-if (!config.LDAP_SYNC_TIME) { helper.error("config", "env var `LDAP_SYNC_TIME` not set correctly"); env_check = false; }
-
-if (isNaN(parseInt(config.LDAP_SAMBANTPWD_MAXCACHETIME))) { helper.error("config", "env var `LDAP_SAMBANTPWD_MAXCACHETIME` must be a number."); env_check = false; }
-
-if ((config.LDAPS_CERTIFICATE || config.LDAPS_KEY) && !(config.LDAPS_CERTIFICATE && config.LDAPS_KEY)) { helper.error("config", "env var `LDAPS_CERTIFICATE` AND `LDAPS_KEY` must be set."); env_check = false; }
-if (config.LDAPS_CERTIFICATE && config.LDAPS_KEY && config.LDAP_PORT != 636) { helper.warn("config", "LDAPS usually runs on port 636. So you may need to set the env var `LDAP_PORT` to 636."); }
-if (!env_check) return;
+if (!helper.checkEnvVars()) return;
 
 const ldapwrapper = require('./ldapwrapper');
 const ldap = require('ldapjs');
-const graph = require('./graph_azuread');
+const ldap_overwrites = require('./ldapjs_overwrites.js');
+ldap_overwrites(ldap);
 
-var nthash = require('smbhash').nthash;
+const graph = require('./graph_azuread');
+const nthash = require('smbhash').nthash;
 
 
 /* build schema */
@@ -69,6 +46,7 @@ var tlsOptions = {};
 //if(config.LDAPS_CERTIFICATE && config.LDAPS_KEY)
 tlsOptions = { certificate: helper.ReadFile(config.LDAPS_CERTIFICATE), key: helper.ReadFile(config.LDAPS_KEY) };
 var server = ldap.createServer(tlsOptions);
+
 
 const interval = config.LDAP_SYNC_TIME /*minutes*/ * 60 * 1000;
 
@@ -105,11 +83,21 @@ setInterval(interval_func, interval);
 ///--- Shared handlers
 const SUFFIX = '';
 function authorize(req, res, next) {
-    /* Any user may search after bind, only cn=root has full power */
+
     var bindi = req.connection.ldap.bindDN.toString().replace(/ /g, '');
     var username = bindi.toLowerCase().replace(config.LDAP_USERRDN + "=", '').replace("," + config.LDAP_USERSDN, '');
 
     const isSearch = (req instanceof ldap.SearchRequest);
+    const isAnonymous = req.connection.ldap.bindDN.equals('cn=anonymous');
+
+    if (config.LDAP_ANONYMOUSBIND == "none" && isAnonymous) {
+        helper.error("server.js", "authorize - denied because of env var `LDAP_ANONYMOUSBIND` ", bindi);
+        return next(new ldap.InsufficientAccessRightsError());
+    }
+
+    /* Any user may search after bind, only cn=root has full power */
+
+
     var isAdmin = false;
 
     if (config.LDAP_BINDUSER) {
@@ -142,22 +130,53 @@ function isUserENVBindUser(binduser) {
 
 function removeSensitiveAttributes(binduser, dn, attributes) {
 
-    if (attributes && attributes.hasOwnProperty("sambaNTPassword")) {
-        var allowSensitiveAttributes = false;
+    if (!attributes) return attributes;
+    const isEnvBindUser = isUserENVBindUser(binduser);
+    var allowSensitiveAttributes = (binduser.equals(dn) || isEnvBindUser);
 
-        if (binduser.equals(dn)) allowSensitiveAttributes = true;
-        if (isUserENVBindUser(binduser)) allowSensitiveAttributes = true;
+    // samba is special, the own user must have access to them
+    if (attributes.hasOwnProperty("sambaNTPassword")) {
 
-        if (config.LDAP_SAMBANTPWD_MAXCACHETIME && attributes["sambaPwdLastSet"])
-            if (config.LDAP_SAMBANTPWD_MAXCACHETIME != -1)
-                if ((attributes["sambaPwdLastSet"] + config.LDAP_SAMBANTPWD_MAXCACHETIME * 60) < Math.floor(Date.now() / 1000))
-                    allowSensitiveAttributes = false;
+        if (config.LDAP_SAMBANTPWD_MAXCACHETIME && attributes["sambaPwdLastSet"] && config.LDAP_SAMBANTPWD_MAXCACHETIME != -1)
+            // time is up
+            if ((attributes["sambaPwdLastSet"] + config.LDAP_SAMBANTPWD_MAXCACHETIME * 60) < Math.floor(Date.now() / 1000)) {
+                attributes["sambaNTPassword"] = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+                attributes["sambaPwdLastSet"] = 0;
+            }
 
+        // user is not allowed to see
         if (!allowSensitiveAttributes) {
             attributes["sambaNTPassword"] = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
             attributes["sambaPwdLastSet"] = 0;
         }
+    }
 
+    // secure attributes - only the respective user and superusers are allowed to see them
+    if (!allowSensitiveAttributes) {
+        if (config.LDAP_SENSITIVE_ATTRIBUTES != "") {
+            const sensitiveAttributes = config.LDAP_SENSITIVE_ATTRIBUTES.split("|");
+            // remove all sensitive attributes from the env var
+            let attKeys = Object.keys(attributes);
+            sensitiveAttributes.forEach(sensAttName => {
+                let foundAttNames = attKeys.filter((key) => key.match(new RegExp(sensAttName, "gi")));
+                foundAttNames.forEach(found => {
+                    delete attributes[found];
+                });
+            });
+        }
+    }
+
+    // secure attributes - only superusers are allowed to see them
+    if (!isEnvBindUser && config.LDAP_SECURE_ATTRIBUTES != "") {
+        const secureAttributes = config.LDAP_SECURE_ATTRIBUTES.split("|");
+        // remove all sensitive attributes from the env var
+        let attKeys = Object.keys(attributes);
+        secureAttributes.forEach(sensAttName => {
+            let foundAttNames = attKeys.filter((key) => key.match(new RegExp(sensAttName, "gi")));
+            foundAttNames.forEach(found => {
+                delete attributes[found];
+            });
+        });
     }
 
     return attributes;
@@ -192,7 +211,7 @@ server.bind(SUFFIX, async (req, res, next) => {
 
             var userAttributes = db[dn]; // removeSensitiveAttributes(req.dn, dn, db[dn]);//
 
-            if (!userAttributes || !userAttributes.hasOwnProperty("sambaNTPassword") || !userAttributes.hasOwnProperty("AzureADuserPrincipalName")) {                
+            if (!userAttributes || !userAttributes.hasOwnProperty("sambaNTPassword") || !userAttributes.hasOwnProperty("AzureADuserPrincipalName")) {
                 helper.log("server.js", "server.bind", username, "Failed login -> mybe not synced yet?");
                 return next(new ldap.InvalidCredentialsError());
             } else {
@@ -251,11 +270,12 @@ server.bind(SUFFIX, async (req, res, next) => {
 // search
 server.search(SUFFIX, authorize, (req, res, next) => {
     try {
-        var dn = req.dn.toString().toLowerCase().replace(/ /g, '');
-        if (!dn) dn = config.LDAP_BASEDN;
+        const isAnonymous = req.connection.ldap.bindDN.equals('cn=anonymous');
+        var dn = req.dn.toString().toLowerCase().replace(/ /g, '') || config.LDAP_BASEDN;
 
         helper.log("server.js", "server.search", 'Search for => DB: ' + dn + '; Scope: ' + req.scope + '; Filter: ' + req.filter + '; Attributes: ' + req.attributes + ';');
 
+        // search for schema/configuration
         if (['cn=SubSchema', 'cn=schema,cn=config', 'cn=schema,cn=configuration'].map(v => v.toLowerCase()).indexOf(dn.toLowerCase()) > -1) {
             res.send({
                 dn: dn,
@@ -265,17 +285,28 @@ server.search(SUFFIX, authorize, (req, res, next) => {
             return next();
         }
 
-        if (!db[dn])
+        let searchableEntries = JSON.parse(JSON.stringify(db));
+        if (config.LDAP_ANONYMOUSBIND == 'domain' && isAnonymous) {
+            for (var key of Object.keys(searchableEntries)) {
+                if (!searchableEntries[key].hasOwnProperty("namingContexts")) {
+                    delete searchableEntries[key];
+                }
+            }
+            helper.log("server.js", "server.search", 'searchableEntries modified for anonymous', Object.keys(searchableEntries).length);
+        } else {
+            helper.log("server.js", "server.search", 'searchableEntries NOT modified', Object.keys(searchableEntries).length);
+        }
+
+        if (!searchableEntries[dn])
             return next(new ldap.NoSuchObjectError(dn));
 
         let scopeCheck;
-
         let bindDN = req.connection.ldap.bindDN;
 
         switch (req.scope) {
             case 'base':
 
-                if (req.filter.matches(removeSensitiveAttributes(bindDN, dn, db[dn]))) {
+                if (req.filter.matches(removeSensitiveAttributes(bindDN, dn, searchableEntries[dn]))) {
                     res.send({
                         dn: dn,
                         attributes: removeSensitiveAttributes(bindDN, dn, db[dn])
@@ -303,12 +334,12 @@ server.search(SUFFIX, authorize, (req, res, next) => {
                 break;
         }
 
-        const keys = Object.keys(db);
+        const keys = Object.keys(searchableEntries);
         for (const key of keys) {
             if (!scopeCheck(key))
                 continue;
 
-            if (req.filter.matches(removeSensitiveAttributes(bindDN, key, db[key]))) {
+            if (req.filter.matches(removeSensitiveAttributes(bindDN, key, searchableEntries[key]))) {
                 res.send({
                     dn: key,
                     attributes: removeSensitiveAttributes(bindDN, key, db[key])
@@ -329,7 +360,7 @@ server.search(SUFFIX, authorize, (req, res, next) => {
 
 // compare entries  
 server.compare(SUFFIX, authorize, (req, res, next) => {
-    const dn = req.dn.toString().toLowerCase().replace(/  /g, ' ').replace(/, /g, ',');
+    const dn = req.dn.toString().toLowerCase().replace(/  {2,}/g, ' ').replace(/, /g, ',');
 
     if (!db[dn])
         return next(new ldap.NoSuchObjectError(dn));
@@ -340,7 +371,7 @@ server.compare(SUFFIX, authorize, (req, res, next) => {
     if (!db[dn][req.attribute])
         return next(new ldap.NoSuchAttributeError(req.attribute));
 
-    const matches = false;
+    var matches = false;
     const vals = db[dn][req.attribute];
     for (const value of vals) {
         if (value === req.value) {
@@ -355,7 +386,7 @@ server.compare(SUFFIX, authorize, (req, res, next) => {
 
 // add entries  
 server.add(SUFFIX, authorize, (req, res, next) => {
-    const dn = req.dn.toString().toLowerCase().replace(/  /g, ' ').replace(/, /g, ',');
+    const dn = req.dn.toString().toLowerCase().replace(/  {2,}/g, ' ').replace(/, /g, ',');
 
     if (db[dn]) {
         helper.error("server.js", "add", "EntryAlreadyExistsError", dn);
@@ -377,7 +408,7 @@ server.add(SUFFIX, authorize, (req, res, next) => {
 
 // delete entries
 server.del(SUFFIX, authorize, (req, res, next) => {
-    const dn = req.dn.toString().toLowerCase().replace(/  /g, ' ').replace(/, /g, ',');
+    const dn = req.dn.toString().toLowerCase().replace(/  {2,}/g, ' ').replace(/, /g, ',');
 
     if (!db[dn]) {
         helper.error("server.js", "del", "NoSuchObjectError", dn);
@@ -391,9 +422,22 @@ server.del(SUFFIX, authorize, (req, res, next) => {
     return next();
 });
 
+server.modifyDN(SUFFIX, authorize, (req, res, next) => {
+
+    helper.error("server.js", "modifyDN", "not yet implemented");
+    return next(new ldap.ProtocolError('not yet implemented'));
+
+    // console.log('DN: ' + req.dn.toString());
+    // console.log('new RDN: ' + req.newRdn.toString());
+    // console.log('deleteOldRDN: ' + req.deleteOldRdn);
+    // console.log('new superior: ' +(req.newSuperior ? req.newSuperior.toString() : ''));
+    // res.end();
+
+});
+
 // edit entries
 server.modify(SUFFIX, authorize, (req, res, next) => {
-    const dn = req.dn.toString().toLowerCase().replace(/  /g, ' ').replace(/, /g, ',');
+    const dn = req.dn.toString().toLowerCase().replace(/  {2,}/g, ' ').replace(/, /g, ',');
 
     if (!req.changes.length) {
         helper.error("server.js", "modify", "ProtocolError", req.changes);
@@ -414,14 +458,11 @@ server.modify(SUFFIX, authorize, (req, res, next) => {
 
         var mod = change.modification;
 
-        // change search attribute(s) to make it "case in-sensitive"
+        // search change/add/delete attribute(s) in lowercase, so the first CamelCase variante is kept
         var modType = Object.keys(entry).find(key => key.toLowerCase() === mod.type.toLowerCase()) || mod.type;
         var modVals = mod.vals;
 
-        // modifiy array to single entry
-        if (['objectclass', 'memberuid', 'member', 'memberof'].indexOf(modType.toLowerCase()) === -1 && modVals.length == 1) {
-            modVals = modVals[0];
-        }
+        helper.log("server.js", "modify", "req.changes -> change-details", { operation: change.operation, modType: modType, modVals: modVals });
 
         //helper.error("server.js", "modify", "modVals2", modVals);
         switch (change.operation) {
@@ -430,14 +471,17 @@ server.modify(SUFFIX, authorize, (req, res, next) => {
                     helper.error("server.js", "modify", "NoSuchAttributeError", modType);
                     return next(new ldap.NoSuchAttributeError(modType));
                 }
-                //helper.error("server.js", "modify", "Info", modType);
-                //helper.error("server.js", "modify", "Info", modVals);
-
 
                 if (!modVals || !modVals.length) {
                     delete entry[modType];
                 } else {
                     entry[modType] = modVals;
+
+                    //modifiy array to single entry
+                    if (['objectclass', 'memberuid', 'member', 'memberof'].indexOf(modType.toLowerCase()) === -1 && entry[modType].length == 1) {
+                        entry[modType] = entry[modType][0];
+                    }
+
                 }
 
                 break;
@@ -446,12 +490,17 @@ server.modify(SUFFIX, authorize, (req, res, next) => {
                 if (!entry[modType]) {
                     entry[modType] = modVals;
                 } else {
+                    if (!Array.isArray(entry[modType])) entry[modType] = [entry[modType]];
                     for (const v of modVals) {
                         if (entry[modType].indexOf(v) === -1)
                             entry[modType].push(v);
                     }
                 }
 
+                //modifiy array to single entry
+                if (['objectclass', 'memberuid', 'member', 'memberof'].indexOf(modType.toLowerCase()) === -1 && entry[modType].length == 1) {
+                    entry[modType] = entry[modType][0];
+                }
                 break;
 
             case 'delete':
@@ -459,7 +508,16 @@ server.modify(SUFFIX, authorize, (req, res, next) => {
                     helper.error("server.js", "modify", "NoSuchAttributeError", modType);
                     return next(new ldap.NoSuchAttributeError(modType));
                 } else {
-                    delete entry[modType];
+                    if (!Array.isArray(entry[modType])) entry[modType] = [entry[modType]];
+
+                    for (const v of modVals) {
+                        let idx = entry[modType].indexOf(v);
+                        if (idx > -1)
+                            entry[modType].splice(idx, 1);
+                    }
+
+                    if (entry[modType].length == 0 || !modVals || modVals.length == 0)
+                        delete entry[modType];
                 }
                 break;
         }
@@ -476,11 +534,11 @@ server.modify(SUFFIX, authorize, (req, res, next) => {
 
 server.on("error", (error) => {
     helper.error("server.js", "!!! error !!!", error);
-})
+});
 
 server.on("uncaughtException", (error) => {
     helper.error("server.js", "!!! uncaughtException !!!", error);
-})
+});
 
 server.listen(config.LDAP_PORT, function () {
     console.log("server.js", '---->  LDAP server up at: ', server.url);

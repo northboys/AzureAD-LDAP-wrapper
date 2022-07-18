@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- env var `LDAP_ANONYMOUSBIND` default value is set to `domain`, so everything works normal on a Synology NAS. However, you may need to change this value to `all` or `none` depending on how you use it.
+- env var `DSM7` is set to `true` as default on new containers
+- env var `GRAPH_FILTER_GROUPS` ist set to `securityEnabled eq true` as default on new containers
+
+### Fixed
+
+- Modify-Requests: Update custom attributes/values and keep the CamelCase for the attribute names
+
+### Added
+
+- env var `LDAP_ANONYMOUSBIND` to restrict access for ldap queries without any authentication if needed.
+- env var `LDAP_SECURE_ATTRIBUTES` to restrict access for the specified attributes only to superusers.
+- env var `LDAP_SENSITIVE_ATTRIBUTES`  to restrict access to the specified attributes to the respective user only and superusers.
+- customizer option to change api endpoints from e.g. v1.0 to beta
+
+## [1.8.0] - 2022-07-09
+
+### Changed
+
 - Reset .cache folder owner every time the container is started
 - Use the SIDs for users/groups from Azure instead of a "randomly" generated one.
 However, you can enable the old handling by setting the env var `LDAP_SAMBA_USEAZURESID` to `false`.
