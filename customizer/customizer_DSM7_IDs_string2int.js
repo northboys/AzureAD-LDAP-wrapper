@@ -1,7 +1,7 @@
 'use strict';
 
-const config = require('../config');
-const helper = require('../helper');
+const config = require('../src/config');
+const helper = require('../src/helper');
 
 var customizer = {};
 
@@ -46,14 +46,17 @@ customizer.ModifyLDAPGlobal = function (all) {
     for (var key of Object.keys(all)) {
         //console.log(`${key}= ${value}`);
         all[key].creatorsName = root;
-        all[key].createTimestamp = "20220301211408Z";
-        all[key].entryCSN = "20220301211408.497736Z#000000#000#000000";
-        all[key].modifiersName = root;
-        all[key].modifyTimestamp = "20220301211408Z";
 
-        if (all[key].hasOwnProperty("namingContexts")) {
-            all[key].contextCSN = "20220301211408.497736Z#000000#000#000000";
-        }
+        if (!all[key].hasOwnProperty("createTimestamp"))
+            all[key].createTimestamp = helper.ldap_now() + "Z";
+
+        if (!all[key].hasOwnProperty("entryCSN"))
+            all[key].entryCSN = helper.ldap_now() + ".000000Z#000000#000#000000";
+
+        all[key].modifiersName = root;
+
+        if (!all[key].hasOwnProperty("modifyTimestamp"))
+            all[key].modifyTimestamp = all[key].createTimestamp;
 
         if (all[key].hasOwnProperty("sambaDomainName")) {
             all[key].sambaDomainName = all[key].sambaDomainName.toLowerCase();
@@ -70,5 +73,6 @@ customizer.ModifyAzureUsers = function (azureusers) {
     return Object.values(azureusers).filter(u => u.hasOwnProperty("givenName") && u.hasOwnProperty("userPrincipalName") && u.givenName != null && u.userPrincipalName.toString().endsWith(config.LDAP_DOMAIN));
 };
 */
+
 
 module.exports = customizer;

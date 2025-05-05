@@ -15,4 +15,11 @@ schema/synology-openldap-export
 schema/*.ps1
 example
 tests
+docs
 *.ps1
+*.env-*
+coverage
+*.md
+certs
+*.code-workspace
+*.cmd
