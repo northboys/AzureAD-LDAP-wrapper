@@ -954,7 +954,7 @@ async function mergeAzureUserEntries(db) {
         shadowMin: 0,
         shadowWarning: 7,
         sn: user.surname,
-        uid: userPrincipalNameOU,
+        uid: user.mail,
         uidNumber: user_hash,
         structuralObjectClass: "inetOrgPerson",
         hasSubordinates: "FALSE",
@@ -975,7 +975,7 @@ async function mergeAzureUserEntries(db) {
         krbPrincipalName: user.userPrincipalName,
         AzureADuserExternal: AzureADuserExternal,
         entryDN: upName,
-        uid: userPrincipalNameOU,
+        uid: user.userPrincipalName,
         displayName: user.displayName,
         sambaSID: generateSID(
           config.LDAP_SAMBA_USEAZURESID,
